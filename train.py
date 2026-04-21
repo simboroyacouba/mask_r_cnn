@@ -401,8 +401,10 @@ class AttentionFPN(nn.Module):
         features = self.fpn(x)
         attended = OrderedDict()
         for key, feat in features.items():
-            cbam = self.cbam_modules.get(key)
-            attended[key] = cbam(feat) if cbam is not None else feat
+            if key in self.cbam_modules:
+                attended[key] = self.cbam_modules[key](feat)
+            else:
+                attended[key] = feat
         return attended
 
 
