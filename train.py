@@ -6,10 +6,13 @@ Classes: toiture_tole_ondulee, toiture_tole_bac, toiture_tuile, toiture_dalle
 
 import os
 import json
+import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.utils.data
 from torch.utils.data import DataLoader, random_split
+from collections import OrderedDict
 import torchvision
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -20,11 +23,13 @@ from pycocotools.coco import COCO
 from pycocotools import mask as coco_mask_utils
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import optuna
 import yaml
 import time
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # =============================================================================
@@ -36,6 +41,13 @@ def load_classes(yaml_path="classes.yaml"):
     with open(yaml_path, 'r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
     return data['classes']
+
+OPTUNA_CONFIG = {
+    "n_trials": 30,
+    "n_epochs_per_trial": 5,       # Epochs courts pour aller vite
+    "study_name": "maskrcnn_cadastral",
+    "output_dir": "./optuna_output",
+}
 
 CONFIG = {
     # Chemins (à adapter)
@@ -317,26 +329,110 @@ def get_transforms(train=True):
 
 
 # =============================================================================
+# MÉCANISME D'ATTENTION (CBAM)
+# =============================================================================
+
+class ChannelAttention(nn.Module):
+    """Squeeze-and-Excitation channel attention"""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(),
+            nn.Linear(mid, channels, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        avg = self.fc(self.avg_pool(x).view(b, c))
+        mx  = self.fc(self.max_pool(x).view(b, c))
+        scale = self.sigmoid(avg + mx).view(b, c, 1, 1)
+        return x * scale
+
+
+class SpatialAttention(nn.Module):
+    """Spatial attention via channel-pooled convolution"""
+
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        scale = self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        return x * scale
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module (channel then spatial)"""
+
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.channel_att = ChannelAttention(channels, reduction)
+        self.spatial_att = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        return self.spatial_att(self.channel_att(x))
+
+
+class AttentionFPN(nn.Module):
+    """Enveloppe autour du FPN qui applique CBAM à chaque niveau de features"""
+
+    def __init__(self, fpn, out_channels=256, cbam_reduction=16, cbam_kernel_size=7):
+        super().__init__()
+        self.fpn = fpn
+        # Clés standard du FPN torchvision : '0','1','2','3' + 'pool'
+        self.cbam_modules = nn.ModuleDict({
+            '0': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '1': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '2': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '3': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            'pool': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+        })
+
+    def forward(self, x):
+        features = self.fpn(x)
+        attended = OrderedDict()
+        for key, feat in features.items():
+            cbam = self.cbam_modules.get(key)
+            attended[key] = cbam(feat) if cbam is not None else feat
+        return attended
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
-def get_model(num_classes):
-    """Créer un Mask R-CNN fine-tuné pour N classes"""
-    
+def get_model(num_classes, cbam_reduction=16, cbam_kernel_size=7):
+    """Créer un Mask R-CNN + CBAM fine-tuné pour N classes"""
+
     # Charger le modèle pré-entraîné sur COCO
     model = maskrcnn_resnet50_fpn_v2(weights="DEFAULT")
-    
+
+    # Injecter l'attention CBAM sur chaque niveau du FPN
+    fpn_out_channels = model.backbone.out_channels  # 256
+    model.backbone.fpn = AttentionFPN(
+        model.backbone.fpn, fpn_out_channels, cbam_reduction, cbam_kernel_size
+    )
+
     # Remplacer le classificateur de boîtes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    
+
     # Remplacer le prédicteur de masques
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
     hidden_layer = 256
     model.roi_heads.mask_predictor = MaskRCNNPredictor(
         in_features_mask, hidden_layer, num_classes
     )
-    
+
     return model
 
 
@@ -435,24 +531,157 @@ def save_checkpoint(model, optimizer, epoch, loss, path, time_stats=None):
 
 
 # =============================================================================
+# OPTIMISATION BAYÉSIENNE (OPTUNA)
+# =============================================================================
+
+def objective(trial, device, train_loader, val_loader, num_classes):
+    """Fonction objectif Optuna — retourne la meilleure val_loss sur N epochs courts"""
+
+    # Espace de recherche
+    lr            = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    weight_decay  = trial.suggest_float("weight_decay",  1e-5, 1e-3, log=True)
+    momentum      = trial.suggest_float("momentum",      0.80, 0.99)
+    lr_step_size  = trial.suggest_int  ("lr_step_size",  3,    15)
+    cbam_reduction   = trial.suggest_categorical("cbam_reduction",   [8, 16, 32])
+    cbam_kernel_size = trial.suggest_categorical("cbam_kernel_size", [3, 5, 7])
+
+    model = get_model(num_classes, cbam_reduction, cbam_kernel_size)
+    model.to(device)
+
+    params    = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=0.1)
+
+    best_val_loss = float('inf')
+
+    for epoch in range(OPTUNA_CONFIG["n_epochs_per_trial"]):
+        train_one_epoch(model, optimizer, train_loader, device, epoch)
+        val_loss = evaluate(model, val_loader, device)
+        scheduler.step()
+
+        trial.report(val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+        best_val_loss = min(best_val_loss, val_loss)
+
+    return best_val_loss
+
+
+def run_optimization(device, train_loader, val_loader, num_classes):
+    """Lancer l'étude Optuna et retourner les meilleurs hyperparamètres"""
+
+    os.makedirs(OPTUNA_CONFIG["output_dir"], exist_ok=True)
+
+    study = optuna.create_study(
+        direction="minimize",
+        study_name=OPTUNA_CONFIG["study_name"],
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2),
+    )
+
+    print(f"\n{'=' * 70}")
+    print(f"   OPTIMISATION BAYÉSIENNE — {OPTUNA_CONFIG['n_trials']} essais")
+    print(f"   {OPTUNA_CONFIG['n_epochs_per_trial']} epochs/essai | "
+          f"sampler: TPE | pruner: Median")
+    print(f"{'=' * 70}\n")
+
+    study.optimize(
+        lambda trial: objective(trial, device, train_loader, val_loader, num_classes),
+        n_trials=OPTUNA_CONFIG["n_trials"],
+        show_progress_bar=True,
+    )
+
+    best = study.best_trial
+    print(f"\n{'=' * 70}")
+    print(f"   MEILLEUR ESSAI #{best.number}  —  val_loss: {best.value:.4f}")
+    print(f"{'=' * 70}")
+    for k, v in best.params.items():
+        print(f"   {k}: {v}")
+
+    # Sauvegarder le rapport Optuna
+    report = {
+        "best_trial": best.number,
+        "best_val_loss": best.value,
+        "best_params": best.params,
+        "all_trials": [
+            {"number": t.number, "value": t.value, "params": t.params,
+             "state": str(t.state)}
+            for t in study.trials
+        ],
+    }
+    report_path = os.path.join(OPTUNA_CONFIG["output_dir"], "optuna_report.json")
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"\n   Rapport sauvegardé : {report_path}")
+
+    # Visualisation de l'historique d'optimisation
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+        values = [t.value for t in study.trials if t.value is not None]
+        axes[0].plot(values, marker='o', linewidth=1.5)
+        axes[0].set_xlabel("Essai")
+        axes[0].set_ylabel("Val Loss")
+        axes[0].set_title("Historique des essais Optuna")
+        axes[0].grid(True, alpha=0.3)
+
+        importances = optuna.importance.get_param_importances(study)
+        axes[1].barh(list(importances.keys()), list(importances.values()))
+        axes[1].set_xlabel("Importance relative")
+        axes[1].set_title("Importance des hyperparamètres")
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(OPTUNA_CONFIG["output_dir"], "optuna_results.png"), dpi=150
+        )
+        plt.close()
+        print(f"   Graphiques : {OPTUNA_CONFIG['output_dir']}/optuna_results.png")
+    except Exception:
+        pass  # la visu est optionnelle
+
+    return best.params
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Mask R-CNN + CBAM - Toitures Cadastrales")
+    parser.add_argument(
+        "--optimize", action="store_true",
+        help="Lancer l'optimisation bayésienne Optuna avant l'entraînement"
+    )
+    parser.add_argument(
+        "--n-trials", type=int, default=OPTUNA_CONFIG["n_trials"],
+        help=f"Nombre d'essais Optuna (défaut: {OPTUNA_CONFIG['n_trials']})"
+    )
+    parser.add_argument(
+        "--n-epochs-trial", type=int, default=OPTUNA_CONFIG["n_epochs_per_trial"],
+        help=f"Epochs par essai Optuna (défaut: {OPTUNA_CONFIG['n_epochs_per_trial']})"
+    )
+    args = parser.parse_args()
+
+    # Mettre à jour la config Optuna depuis les arguments CLI
+    OPTUNA_CONFIG["n_trials"] = args.n_trials
+    OPTUNA_CONFIG["n_epochs_per_trial"] = args.n_epochs_trial
+
     print("=" * 70)
     print("   MASK R-CNN - Segmentation des Toitures Cadastrales")
     print("=" * 70)
-    
+
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n📱 Device: {device}")
     if device.type == 'cuda':
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
+
     # Créer le dossier de sortie
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
-    
+
     # Dataset
     print("\n📂 Chargement du dataset...")
     full_dataset = CadastralDataset(
@@ -460,22 +689,24 @@ def main():
         CONFIG["annotations_file"],
         transforms=None
     )
-    
+
     # Split train/val
     train_size = int(CONFIG["train_split"] * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(
-        full_dataset, 
+        full_dataset,
         [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
-    
+
     print(f"   Train: {len(train_dataset)} images")
     print(f"   Val: {len(val_dataset)} images")
-    
+
     # Appliquer les transformations
     train_dataset.dataset.transforms = get_transforms(train=True)
-    
+
+    pin = device.type == 'cuda'
+
     # DataLoaders
     train_loader = DataLoader(
         train_dataset,
@@ -483,25 +714,41 @@ def main():
         shuffle=True,
         num_workers=CONFIG["num_workers"],
         collate_fn=collate_fn,
-        pin_memory=True if device.type == 'cuda' else False
+        pin_memory=pin,
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=CONFIG["batch_size"],
         shuffle=False,
         num_workers=CONFIG["num_workers"],
         collate_fn=collate_fn,
-        pin_memory=True if device.type == 'cuda' else False
+        pin_memory=pin,
     )
-    
-    # Modèle
-    print("\n🧠 Création du modèle...")
+
     num_classes = len(CONFIG["classes"])
-    model = get_model(num_classes)
+
+    # --- Optimisation bayésienne (optionnelle) ---
+    best_params = {}
+    if args.optimize:
+        best_params = run_optimization(device, train_loader, val_loader, num_classes)
+        # Injecter les meilleurs hyperparamètres dans CONFIG
+        for key in ("learning_rate", "weight_decay", "momentum", "lr_step_size"):
+            if key in best_params:
+                CONFIG[key] = best_params[key]
+        print(f"\n   Hyperparamètres optimisés appliqués à l'entraînement complet.")
+
+    # --- Modèle ---
+    cbam_reduction   = best_params.get("cbam_reduction",   16)
+    cbam_kernel_size = best_params.get("cbam_kernel_size",  7)
+
+    print("\n🧠 Création du modèle...")
+    model = get_model(num_classes, cbam_reduction, cbam_kernel_size)
     model.to(device)
+    print(f"   Architecture: Mask R-CNN ResNet50-FPN v2 + CBAM Attention")
+    print(f"   CBAM reduction={cbam_reduction}, kernel_size={cbam_kernel_size}")
     print(f"   Classes: {CONFIG['classes']}")
-    
+
     # Optimiseur
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
@@ -510,7 +757,7 @@ def main():
         momentum=CONFIG["momentum"],
         weight_decay=CONFIG["weight_decay"]
     )
-    
+
     # Scheduler
     lr_scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer,
