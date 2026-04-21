@@ -11,7 +11,9 @@ Fonctionnalités:
 
 import os
 import torch
+import torch.nn as nn
 import numpy as np
+from collections import OrderedDict
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -79,11 +81,84 @@ def format_time(seconds):
 
 
 # =============================================================================
+# MÉCANISME D'ATTENTION (CBAM) — doit correspondre à train.py
+# =============================================================================
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        mid = max(channels // reduction, 8)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(),
+            nn.Linear(mid, channels, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c = x.shape[:2]
+        avg = self.fc(self.avg_pool(x).view(b, c))
+        mx  = self.fc(self.max_pool(x).view(b, c))
+        return x * self.sigmoid(avg + mx).view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = x.mean(dim=1, keepdim=True)
+        mx, _ = x.max(dim=1, keepdim=True)
+        return x * self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.channel_att = ChannelAttention(channels, reduction)
+        self.spatial_att = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        return self.spatial_att(self.channel_att(x))
+
+
+class AttentionFPN(nn.Module):
+    def __init__(self, fpn, out_channels=256, cbam_reduction=16, cbam_kernel_size=7):
+        super().__init__()
+        self.fpn = fpn
+        self.cbam_modules = nn.ModuleDict({
+            '0': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '1': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '2': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            '3': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+            'pool': CBAM(out_channels, cbam_reduction, cbam_kernel_size),
+        })
+
+    def forward(self, x):
+        features = self.fpn(x)
+        attended = OrderedDict()
+        for key, feat in features.items():
+            if key in self.cbam_modules:
+                attended[key] = self.cbam_modules[key](feat)
+            else:
+                attended[key] = feat
+        return attended
+
+
+# =============================================================================
 # MODÈLE
 # =============================================================================
 
-def get_model(num_classes):
+def get_model(num_classes, cbam_reduction=16, cbam_kernel_size=7):
     model = maskrcnn_resnet50_fpn_v2(weights=None)
+    fpn_out_channels = model.backbone.out_channels
+    model.backbone.fpn = AttentionFPN(
+        model.backbone.fpn, fpn_out_channels, cbam_reduction, cbam_kernel_size
+    )
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
@@ -92,12 +167,16 @@ def get_model(num_classes):
 
 
 def load_model(checkpoint_path, device):
-    model = get_model(len(CLASSES))
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_config   = checkpoint.get('model_config', {})
+    cbam_reduction   = model_config.get('cbam_reduction',   16)
+    cbam_kernel_size = model_config.get('cbam_kernel_size',  7)
+    model = get_model(len(CLASSES), cbam_reduction, cbam_kernel_size)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
     print(f"✅ Modèle chargé: {checkpoint_path}")
+    print(f"   CBAM: reduction={cbam_reduction}, kernel_size={cbam_kernel_size}")
     return model
 
 

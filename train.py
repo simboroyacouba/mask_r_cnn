@@ -519,8 +519,8 @@ def evaluate(model, data_loader, device):
     return total_loss / len(data_loader)
 
 
-def save_checkpoint(model, optimizer, epoch, loss, path, time_stats=None):
-    """Sauvegarder un checkpoint avec informations de temps"""
+def save_checkpoint(model, optimizer, epoch, loss, path, time_stats=None, model_config=None):
+    """Sauvegarder un checkpoint avec informations de temps et config du modèle"""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -529,6 +529,8 @@ def save_checkpoint(model, optimizer, epoch, loss, path, time_stats=None):
     }
     if time_stats:
         checkpoint['time_stats'] = time_stats
+    if model_config:
+        checkpoint['model_config'] = model_config
     torch.save(checkpoint, path)
 
 
@@ -743,6 +745,7 @@ def main():
     # --- Modèle ---
     cbam_reduction   = best_params.get("cbam_reduction",   16)
     cbam_kernel_size = best_params.get("cbam_kernel_size",  7)
+    model_config = {"cbam_reduction": cbam_reduction, "cbam_kernel_size": cbam_kernel_size}
 
     print("\n🧠 Création du modèle...")
     model = get_model(num_classes, cbam_reduction, cbam_kernel_size)
@@ -833,7 +836,8 @@ def main():
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
                 os.path.join(CONFIG["output_dir"], "best_model.pth"),
-                time_stats={'epoch_time': time_stats['epoch_time'], 'total_elapsed': time_stats['total_elapsed']}
+                time_stats={'epoch_time': time_stats['epoch_time'], 'total_elapsed': time_stats['total_elapsed']},
+                model_config=model_config,
             )
             print(f"   ✅ Meilleur modèle sauvegardé!")
         
@@ -842,7 +846,8 @@ def main():
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
                 os.path.join(CONFIG["output_dir"], f"checkpoint_epoch_{epoch+1}.pth"),
-                time_stats={'epoch_time': time_stats['epoch_time'], 'total_elapsed': time_stats['total_elapsed']}
+                time_stats={'epoch_time': time_stats['epoch_time'], 'total_elapsed': time_stats['total_elapsed']},
+                model_config=model_config,
             )
             print(f"   💾 Checkpoint epoch {epoch+1} sauvegardé")
     
@@ -856,7 +861,8 @@ def main():
     save_checkpoint(
         model, optimizer, CONFIG["num_epochs"]-1, val_loss,
         os.path.join(CONFIG["output_dir"], "final_model.pth"),
-        time_stats=final_time_stats
+        time_stats=final_time_stats,
+        model_config=model_config,
     )
     
     # Sauvegarder l'historique complet
