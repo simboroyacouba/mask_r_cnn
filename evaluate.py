@@ -366,10 +366,12 @@ class MetricsCalculator:
                         else:
                             iou_matrix[i, j] = box_iou_val
 
-                # Enregistrer uniquement l'IoU de la meilleure correspondance
-                # (pas toutes les paires, ce qui diluerait la moyenne avec des IoU ~0)
-                for i in range(n_pred):
-                    if n_gt > 0:
+                # IoU stats: meilleure correspondance GT par prédiction (score >= seuil)
+                score_thresh = CONFIG.get('score_threshold', 0.5)
+                if n_gt > 0:
+                    for i in range(n_pred):
+                        if pred_s[i] < score_thresh:
+                            continue
                         best_j = int(np.argmax(box_iou_matrix[i]))
                         self.box_ious.append(box_iou_matrix[i, best_j])
                         if pred_m.shape[0] > i and gt_m.shape[0] > 0:
