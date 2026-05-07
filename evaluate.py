@@ -221,42 +221,54 @@ class AttentionFPN(nn.Module):
 # MODÈLE
 # =============================================================================
 
-def get_model(num_classes, cbam_reduction=16, cbam_kernel_size=7):
-    """Créer le modèle Mask R-CNN + CBAM"""
-    model = maskrcnn_resnet50_fpn_v2(weights=None)
+def _build_heads(model, num_classes):
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, 256, num_classes)
 
+
+def get_model_simple(num_classes):
+    """Mask R-CNN standard sans CBAM."""
+    model = maskrcnn_resnet50_fpn_v2(weights=None)
+    _build_heads(model, num_classes)
+    return model
+
+
+def get_model_attention(num_classes, cbam_reduction=16, cbam_kernel_size=7):
+    """Mask R-CNN avec AttentionFPN (CBAM sur le FPN)."""
+    model = maskrcnn_resnet50_fpn_v2(weights=None)
     fpn_out_channels = model.backbone.out_channels
     model.backbone.fpn = AttentionFPN(
         model.backbone.fpn, fpn_out_channels, cbam_reduction, cbam_kernel_size
     )
-
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(in_features_mask, 256, num_classes)
-
+    _build_heads(model, num_classes)
     return model
 
 
 def load_model(model_path, num_classes, device):
-    """Charger le modèle entraîné — lit les paramètres CBAM depuis le checkpoint"""
+    """Charger le modèle entraîné — détecte automatiquement simple ou attention."""
     checkpoint = torch.load(model_path, map_location=device)
+    state_dict = checkpoint['model_state_dict']
 
-    # Lire les paramètres CBAM sauvegardés, sinon utiliser les valeurs par défaut
-    model_config   = checkpoint.get('model_config', {})
-    cbam_reduction   = model_config.get('cbam_reduction',   16)
-    cbam_kernel_size = model_config.get('cbam_kernel_size',  7)
+    # Détecter l'architecture depuis les clés du state_dict
+    has_cbam = any(k.startswith('backbone.fpn.cbam_modules') for k in state_dict)
 
-    model = get_model(num_classes, cbam_reduction, cbam_kernel_size)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if has_cbam:
+        model_config     = checkpoint.get('model_config', {})
+        cbam_reduction   = model_config.get('cbam_reduction',   16)
+        cbam_kernel_size = model_config.get('cbam_kernel_size',  7)
+        model = get_model_attention(num_classes, cbam_reduction, cbam_kernel_size)
+        print(f"   Architecture: Mask R-CNN + AttentionFPN (CBAM reduction={cbam_reduction}, kernel={cbam_kernel_size})")
+    else:
+        model = get_model_simple(num_classes)
+        print(f"   Architecture: Mask R-CNN standard")
+
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
-    print(f"Modèle chargé : {model_path}")
-    print(f"Epoch : {checkpoint.get('epoch', 'N/A')}")
-    print(f"CBAM  : reduction={cbam_reduction}, kernel_size={cbam_kernel_size}")
-
+    print(f"✅ Modèle chargé: {model_path} (epoch={checkpoint.get('epoch', 'N/A')})")
     return model
 
 
