@@ -172,7 +172,27 @@ def load_model(checkpoint_path, device):
     cbam_reduction   = model_config.get('cbam_reduction',   16)
     cbam_kernel_size = model_config.get('cbam_kernel_size',  7)
     model = get_model(len(CLASSES), cbam_reduction, cbam_kernel_size)
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    state_dict = checkpoint['model_state_dict']
+
+    # Checkpoint saved before AttentionFPN: backbone.fpn.* → backbone.fpn.fpn.*
+    _fpn_prefixes = ('backbone.fpn.inner_blocks', 'backbone.fpn.layer_blocks', 'backbone.fpn.extra_blocks')
+    if any(k.startswith(p) for k in state_dict for p in _fpn_prefixes):
+        remapped = OrderedDict()
+        for k, v in state_dict.items():
+            if any(k.startswith(p) for p in _fpn_prefixes):
+                remapped[k.replace('backbone.fpn.', 'backbone.fpn.fpn.', 1)] = v
+            else:
+                remapped[k] = v
+        state_dict = remapped
+        print("   ⚠️  Checkpoint pré-AttentionFPN détecté — clés FPN remappées")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"   ℹ️  Clés absentes (init aléatoire): {len(missing)} (ex: {missing[0]})")
+    if unexpected:
+        print(f"   ℹ️  Clés inattendues ignorées: {len(unexpected)}")
+
     model.to(device)
     model.eval()
     print(f"✅ Modèle chargé: {checkpoint_path}")
